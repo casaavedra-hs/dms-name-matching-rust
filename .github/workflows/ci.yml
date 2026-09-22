@@ -32,64 +32,59 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Extract source (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Expand-Archive -Path source-v11.3.3.zip -DestinationPath source -Force
-          Get-ChildItem source
-
-      - name: Extract source (Unix)
-        if: runner.os != 'Windows'
+      - name: Restore application source
         shell: bash
         run: |
-          mkdir -p source
-          unzip -q source-v11.3.3.zip -d source
-          find source -maxdepth 2 -type d -print
+          rm -rf app
+          mkdir -p app
+          tar -xzf ci/appsrc.tar.gz -C app
+          test -f app/Cargo.toml
+          test -f app/src/engine.rs
+          test -f app/web/index.html
+          echo "Restored source archive."
+          wc -c app/src/engine.rs app/web/index.html
 
       - name: Install pinned Rust
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.98.1
 
-      - name: Locate Cargo project
-        id: project
-        shell: bash
-        run: |
-          MANIFEST=$(find source -name Cargo.toml -print -quit)
-          if [ -z "$MANIFEST" ]; then
-            echo "Cargo.toml not found"
-            exit 1
-          fi
-          APP_DIR=$(dirname "$MANIFEST")
-          echo "app_dir=$APP_DIR" >> "$GITHUB_OUTPUT"
-          echo "manifest=$MANIFEST" >> "$GITHUB_OUTPUT"
-          echo "Using $MANIFEST"
-
       - name: Generate lockfile
+        working-directory: app
         shell: bash
-        run: cargo generate-lockfile --manifest-path "${{ steps.project.outputs.manifest }}"
+        run: cargo generate-lockfile
 
       - name: Cargo check
+        working-directory: app
         shell: bash
-        run: cargo check --manifest-path "${{ steps.project.outputs.manifest }}"
+        run: cargo check
 
       - name: Unit tests
+        working-directory: app
         shell: bash
-        run: cargo test --manifest-path "${{ steps.project.outputs.manifest }}" --all-targets
+        run: cargo test --all-targets
 
       - name: Release build
+        working-directory: app
         shell: bash
-        run: cargo build --release --manifest-path "${{ steps.project.outputs.manifest }}"
+        run: cargo build --release
+
+      - name: Verify release executable
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            test -f app/target/release/dms-name-matching.exe
+          else
+            test -f app/target/release/dms-name-matching
+          fi
 
       - name: Package Windows
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $app = "${{ steps.project.outputs.app_dir }}"
           $dist = "dist/windows"
           New-Item -ItemType Directory -Force -Path $dist | Out-Null
-          Copy-Item "$app/target/release/dms-name-matching.exe" "$dist/DMS_Name_Matching.exe"
+          Copy-Item "app/target/release/dms-name-matching.exe" "$dist/DMS_Name_Matching.exe"
           @'
           @echo off
           cd /d "%~dp0"
@@ -102,7 +97,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist/linux
-          cp "${{ steps.project.outputs.app_dir }}/target/release/dms-name-matching" dist/linux/DMS_Name_Matching
+          cp app/target/release/dms-name-matching dist/linux/DMS_Name_Matching
           chmod +x dist/linux/DMS_Name_Matching
           sha256sum dist/linux/DMS_Name_Matching > dist/linux/SHA256.txt
 
@@ -111,7 +106,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist/macos
-          cp "${{ steps.project.outputs.app_dir }}/target/release/dms-name-matching" dist/macos/DMS_Name_Matching
+          cp app/target/release/dms-name-matching dist/macos/DMS_Name_Matching
           chmod +x dist/macos/DMS_Name_Matching
           shasum -a 256 dist/macos/DMS_Name_Matching > dist/macos/SHA256.txt
 

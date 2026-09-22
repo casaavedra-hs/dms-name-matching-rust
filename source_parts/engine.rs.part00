@@ -201,20 +201,4 @@ fn config_hash(cfg: &AppConfig) -> Result<String> {
         mode: cfg.mode, consolidation: cfg.consolidation,
         source1_host: &cfg.source1.host, source1_port: cfg.source1.port, source1_db: &cfg.source1.database, source1_table: &cfg.source1.table,
         source2_host: &cfg.source2.host, source2_port: cfg.source2.port, source2_db: &cfg.source2.database, source2_table: &cfg.source2.table,
-        fields1: &cfg.source1_fields, fields2: &cfg.source2_fields,
-        levels: &cfg.selected_levels, thresholds: &cfg.thresholds,
-        normalization: NORMALIZATION_VERSION,
-    };
-    let bytes = serde_json::to_vec(&safe)?;
-    Ok(format!("{:x}", md5::compute(bytes)))
-}
-
-fn base_signature(cfg: &AppConfig) -> Result<String> {
-    #[derive(Serialize)]
-    struct BaseSig<'a> {
-        host: &'a str, port: u16, database: &'a str, table: &'a str,
-        fields: &'a crate::model::FieldMap, normalization: &'static str,
-    }
-    let s = BaseSig { host:&cfg.source1.host, port:cfg.source1.port, database:&cfg.source1.database, table:&cfg.source1.table, fields:&cfg.source1_fields, normalization:NORMALIZATION_VERSION };
-    Ok(format!("{:x}", md5::compute(serde_json::to_vec(&s)?)))
-}
+        fields1: &cfg.source1_fields, fields2
