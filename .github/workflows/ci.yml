@@ -26,17 +26,23 @@ jobs:
           - name: macOS
             os: macos-latest
             artifact: DMS-Name-Matching-macOS
+
     runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Assemble engine source
+      - name: Restore application source
         shell: bash
         run: |
-          cat source_parts/engine.rs.part* > app/src/engine.rs
-          test -s app/src/engine.rs
-          echo "engine.rs bytes: $(wc -c < app/src/engine.rs)"
+          rm -rf app
+          mkdir -p app
+          tar -xzf ci/appsrc.tar.gz -C app
+          test -f app/Cargo.toml
+          test -f app/src/engine.rs
+          test -f app/web/index.html
+          echo "Restored source archive."
+          wc -c app/src/engine.rs app/web/index.html
 
       - name: Install pinned Rust
         uses: dtolnay/rust-toolchain@master
@@ -44,33 +50,32 @@ jobs:
           toolchain: 1.98.1
 
       - name: Generate lockfile
-        shell: bash
         working-directory: app
+        shell: bash
         run: cargo generate-lockfile
 
       - name: Cargo check
-        shell: bash
         working-directory: app
+        shell: bash
         run: cargo check
 
       - name: Unit tests
-        shell: bash
         working-directory: app
+        shell: bash
         run: cargo test --all-targets
 
       - name: Release build
-        shell: bash
         working-directory: app
+        shell: bash
         run: cargo build --release
 
-      - name: Smoke test
+      - name: Verify release executable
         shell: bash
-        working-directory: app
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
-            test -f target/release/dms-name-matching.exe
+            test -f app/target/release/dms-name-matching.exe
           else
-            test -f target/release/dms-name-matching
+            test -f app/target/release/dms-name-matching
           fi
 
       - name: Package Windows
