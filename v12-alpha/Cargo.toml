@@ -1,0 +1,13 @@
+[package]
+name = "dms-name-matching-v12-alpha"
+version = "12.0.0-alpha.1"
+edition = "2021"
+description = "DMS Name Matching Enterprise v12 alpha desktop-local web shell"
+
+[dependencies]
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = true
