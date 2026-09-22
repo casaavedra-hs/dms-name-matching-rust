@@ -27,3 +27,6 @@ The `Cross-platform CI` workflow runs tests and release builds on:
 - macOS
 
 The Windows artifact contains a precompiled `DMS_Name_Matching.exe`; no Rust, Cargo, Python, Node, Streamlit, compiler, or internet connection is required on the target workstation after download.
+
+
+CI verification branch: cross-platform smoke/build validation.
