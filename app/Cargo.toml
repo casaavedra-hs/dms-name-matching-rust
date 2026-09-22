@@ -1,6 +1,6 @@
 [package]
 name = "dms-name-matching"
-version = "11.3.3"
+version = "12.0.0"
 edition = "2024"
 rust-version = "1.98"
 description = "High-volume DMS name matching and deduplication engine"
@@ -22,6 +22,7 @@ num_cpus = "=1.17.0"
 rayon = "=1.12.0"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
+sha2 = "=0.10.9"
 strsim = "=0.11.1"
 unicode-normalization = "=0.1.24"
 
