@@ -1,0 +1,138 @@
+name: Cross-platform CI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+            artifact: DMS-Name-Matching-Windows-x64
+          - name: Linux x64
+            os: ubuntu-latest
+            artifact: DMS-Name-Matching-Linux-x64
+          - name: macOS
+            os: macos-latest
+            artifact: DMS-Name-Matching-macOS
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract source (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Expand-Archive -Path source-v11.3.3.zip -DestinationPath source -Force
+          Get-ChildItem source
+
+      - name: Extract source (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p source
+          unzip -q source-v11.3.3.zip -d source
+          find source -maxdepth 2 -type d -print
+
+      - name: Install pinned Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+
+      - name: Locate Cargo project
+        id: project
+        shell: bash
+        run: |
+          MANIFEST=$(find source -name Cargo.toml -print -quit)
+          if [ -z "$MANIFEST" ]; then
+            echo "Cargo.toml not found"
+            exit 1
+          fi
+          APP_DIR=$(dirname "$MANIFEST")
+          echo "app_dir=$APP_DIR" >> "$GITHUB_OUTPUT"
+          echo "manifest=$MANIFEST" >> "$GITHUB_OUTPUT"
+          echo "Using $MANIFEST"
+
+      - name: Generate lockfile
+        shell: bash
+        run: cargo generate-lockfile --manifest-path "${{ steps.project.outputs.manifest }}"
+
+      - name: Cargo check
+        shell: bash
+        run: cargo check --manifest-path "${{ steps.project.outputs.manifest }}"
+
+      - name: Unit tests
+        shell: bash
+        run: cargo test --manifest-path "${{ steps.project.outputs.manifest }}" --all-targets
+
+      - name: Release build
+        shell: bash
+        run: cargo build --release --manifest-path "${{ steps.project.outputs.manifest }}"
+
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $app = "${{ steps.project.outputs.app_dir }}"
+          $dist = "dist/windows"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item "$app/target/release/dms-name-matching.exe" "$dist/DMS_Name_Matching.exe"
+          @'
+          @echo off
+          cd /d "%~dp0"
+          start "DMS Name Matching" "%~dp0DMS_Name_Matching.exe"
+          '@ | Set-Content -Encoding ASCII "$dist/DMS Name Matching.bat"
+          Get-FileHash "$dist/DMS_Name_Matching.exe" -Algorithm SHA256 | Format-List | Out-File "$dist/SHA256.txt"
+
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p dist/linux
+          cp "${{ steps.project.outputs.app_dir }}/target/release/dms-name-matching" dist/linux/DMS_Name_Matching
+          chmod +x dist/linux/DMS_Name_Matching
+          sha256sum dist/linux/DMS_Name_Matching > dist/linux/SHA256.txt
+
+      - name: Package macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p dist/macos
+          cp "${{ steps.project.outputs.app_dir }}/target/release/dms-name-matching" dist/macos/DMS_Name_Matching
+          chmod +x dist/macos/DMS_Name_Matching
+          shasum -a 256 dist/macos/DMS_Name_Matching > dist/macos/SHA256.txt
+
+      - name: Upload Windows artifact
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/windows
+          if-no-files-found: error
+
+      - name: Upload Linux artifact
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/linux
+          if-no-files-found: error
+
+      - name: Upload macOS artifact
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/macos
+          if-no-files-found: error
