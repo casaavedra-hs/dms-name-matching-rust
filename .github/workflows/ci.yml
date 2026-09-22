@@ -3,8 +3,6 @@ name: Cross-platform CI
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -32,17 +30,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Restore application source
+      - name: Extract uploaded source package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (Test-Path source) { Remove-Item source -Recurse -Force }
+          New-Item -ItemType Directory -Path source | Out-Null
+          Expand-Archive -LiteralPath "DMS_Name_Matching_Rust_v11_3_3_COMPLETE.zip" -DestinationPath source -Force
+
+      - name: Extract uploaded source package (Linux/macOS)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
-          rm -rf app
-          mkdir -p app
-          tar -xzf ci/appsrc.tar.gz -C app
-          test -f app/Cargo.toml
-          test -f app/src/engine.rs
-          test -f app/web/index.html
-          echo "Restored source archive."
-          wc -c app/src/engine.rs app/web/index.html
+          rm -rf source
+          mkdir source
+          unzip -q DMS_Name_Matching_Rust_v11_3_3_COMPLETE.zip -d source
+
+      - name: Locate Rust application
+        shell: bash
+        run: |
+          MANIFEST="$(find source -type f -name Cargo.toml -print -quit)"
+          if [ -z "$MANIFEST" ]; then
+            echo "Cargo.toml was not found in the uploaded package."
+            find source -maxdepth 4 -type f | sort | head -200
+            exit 1
+          fi
+          APP_DIR="$(dirname "$MANIFEST")"
+          echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
+          echo "MANIFEST=$MANIFEST" >> "$GITHUB_ENV"
+          echo "Rust application: $APP_DIR"
+          test -f "$APP_DIR/src/main.rs"
 
       - name: Install pinned Rust
         uses: dtolnay/rust-toolchain@master
@@ -50,32 +67,28 @@ jobs:
           toolchain: 1.98.1
 
       - name: Generate lockfile
-        working-directory: app
         shell: bash
-        run: cargo generate-lockfile
+        run: cargo generate-lockfile --manifest-path "$MANIFEST"
 
       - name: Cargo check
-        working-directory: app
         shell: bash
-        run: cargo check
+        run: cargo check --manifest-path "$MANIFEST"
 
       - name: Unit tests
-        working-directory: app
         shell: bash
-        run: cargo test --all-targets
+        run: cargo test --manifest-path "$MANIFEST" --all-targets
 
       - name: Release build
-        working-directory: app
         shell: bash
-        run: cargo build --release
+        run: cargo build --release --manifest-path "$MANIFEST"
 
       - name: Verify release executable
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
-            test -f app/target/release/dms-name-matching.exe
+            test -f "$APP_DIR/target/release/dms-name-matching.exe"
           else
-            test -f app/target/release/dms-name-matching
+            test -f "$APP_DIR/target/release/dms-name-matching"
           fi
 
       - name: Package Windows
@@ -84,7 +97,7 @@ jobs:
         run: |
           $dist = "dist/windows"
           New-Item -ItemType Directory -Force -Path $dist | Out-Null
-          Copy-Item "app/target/release/dms-name-matching.exe" "$dist/DMS_Name_Matching.exe"
+          Copy-Item "$env:APP_DIR/target/release/dms-name-matching.exe" "$dist/DMS_Name_Matching.exe"
           @'
           @echo off
           cd /d "%~dp0"
@@ -97,7 +110,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist/linux
-          cp app/target/release/dms-name-matching dist/linux/DMS_Name_Matching
+          cp "$APP_DIR/target/release/dms-name-matching" dist/linux/DMS_Name_Matching
           chmod +x dist/linux/DMS_Name_Matching
           sha256sum dist/linux/DMS_Name_Matching > dist/linux/SHA256.txt
 
@@ -106,7 +119,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist/macos
-          cp app/target/release/dms-name-matching dist/macos/DMS_Name_Matching
+          cp "$APP_DIR/target/release/dms-name-matching" dist/macos/DMS_Name_Matching
           chmod +x dist/macos/DMS_Name_Matching
           shasum -a 256 dist/macos/DMS_Name_Matching > dist/macos/SHA256.txt
 
