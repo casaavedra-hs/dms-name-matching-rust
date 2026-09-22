@@ -1,0 +1,135 @@
+      cursor = hi;
+        out.exec_drop(format!("UPDATE {} SET build_cursor=?,row_count=row_count+?,updated_at=NOW() WHERE id=1 AND base_signature=?", db::qident(BASE_REGISTRY)), (&cursor, inserted, sig))?;
+        out.query_drop("COMMIT")?;
+        log(tx, format!("Base index checkpoint: source key {cursor}"));
+    }
+    out.exec_drop(format!("UPDATE {} SET status='READY',built_at=NOW(),updated_at=NOW() WHERE id=1 AND base_signature=?", db::qident(BASE_REGISTRY)), (sig,))?;
+    log(tx, "Base index ready.");
+    Ok(())
+}
+
+fn stream_stage_base(cfg: &AppConfig, output_pool: &Pool, sig: &str, cursor: String, tx: &Sender<EngineEvent>, control: &EngineControl) -> Result<()> {
+    let src_pool = db::pool(&cfg.source1)?;
+    let mut last = cursor;
+    loop {
+        check_control(control)?;
+        let rows = read_source_page(&src_pool, &cfg.source1, &cfg.source1_fields, &last, cfg.performance.exact_batch_size)?;
+        if rows.is_empty() { break; }
+        let next = rows.last().unwrap().row_key.clone();
+        let mut out = output_pool.get_conn()?;
+        out.query_drop("START TRANSACTION")?;
+        insert_base_rows(&mut out, &rows)?;
+        out.exec_drop(format!("UPDATE {} SET build_cursor=?,row_count=row_count+?,updated_at=NOW() WHERE id=1 AND base_signature=?", db::qident(BASE_REGISTRY)), (&next, rows.len() as u64, sig))?;
+        out.query_drop("COMMIT")?;
+        last = next;
+        log(tx, format!("Base index streamed through source key {last}"));
+    }
+    let mut out = output_pool.get_conn()?;
+    out.exec_drop(format!("UPDATE {} SET status='READY',built_at=NOW(),updated_at=NOW() WHERE id=1 AND base_signature=?", db::qident(BASE_REGISTRY)), (sig,))?;
+    Ok(())
+}
+
+fn stage_input(job_id: &str, cfg: &AppConfig, output_pool: &Pool, tx: &Sender<EngineEvent>, control: &EngineControl) -> Result<()> {
+    let (source, fields) = source_for_stage(cfg);
+    let mut out = output_pool.get_conn()?;
+    let cursor: Option<String> = out.exec_first(format!("SELECT stage_cursor FROM {} WHERE job_id=?", db::qident(JOBS_TABLE)), (job_id,))?;
+    if cursor.as_deref() == Some("__DONE__") {
+        log(tx, "Input staging already complete; resuming from matching checkpoint.");
+        return Ok(());
+    }
+    let mut last = cursor.unwrap_or_default();
+    drop(out);
+
+    if can_fast_stage(source, &cfg.destination) {
+        match fast_stage_input(job_id, cfg, output_pool, source, fields, last.clone(), tx, control) {
+            Ok(()) => return Ok(()),
+            Err(e) => log(tx, format!("Fast server-side input staging was unavailable ({e}). Falling back to Rust streaming.")),
+        }
+    }
+
+    let src_pool = db::pool(source)?;
+    loop {
+        check_control(control)?;
+        let rows = read_source_page(&src_pool, source, fields, &last, cfg.performance.exact_batch_size)?;
+        if rows.is_empty() { break; }
+        let next = rows.last().unwrap().row_key.clone();
+        let mut c = output_pool.get_conn()?;
+        c.query_drop("START TRANSACTION")?;
+        insert_stage_rows(&mut c, job_id, &rows)?;
+        let inserted = rows.len() as u64;
+        c.exec_drop(format!("UPDATE {} SET stage_cursor=?,current_phase='STAGING',total_source_rows=total_source_rows+?,updated_at=NOW() WHERE job_id=?", db::qident(JOBS_TABLE)), (&next, inserted, job_id))?;
+        c.query_drop("COMMIT")?;
+        last = next;
+        log(tx, format!("Input stage checkpoint: source key {last}"));
+    }
+    let mut c = output_pool.get_conn()?;
+    c.exec_drop(format!("UPDATE {} SET stage_cursor='__DONE__',current_phase='STAGED',updated_at=NOW() WHERE job_id=?", db::qident(JOBS_TABLE)), (job_id,))?;
+    log(tx, "Input staging complete.");
+    Ok(())
+}
+
+fn fast_stage_input(job_id: &str, cfg: &AppConfig, output_pool: &Pool, source: &crate::model::DbConfig, fields: &crate::model::FieldMap, mut cursor: String, tx: &Sender<EngineEvent>, control: &EngineControl) -> Result<()> {
+    let mut out = output_pool.get_conn()?;
+    loop {
+        check_control(control)?;
+        let hi = match high_key(&mut out, source, &fields.row_key, &cursor, cfg.performance.exact_batch_size)? { Some(x) => x, None => break };
+        let (row_key, person_id, first, middle, mi, last, dob, barangay, city) = normalized_select_sql(fields);
+        let src = db::qtable(&source.database, &source.table);
+        let stage = db::qident(STAGE_TABLE);
+        let keycol = db::qident(&fields.row_key);
+        let where_sql = if cursor.is_empty() { format!("{keycol}<=?") } else { format!("{keycol}>? AND {keycol}<=?") };
+        let derived = format!(r#"SELECT {row_key} source_row_key,{person_id} source_record_id,{first} first_name,{middle} middle_name,{mi} middle_initial,{last} last_name,{dob} birthdate,{barangay} barangay_code,{city} city_code FROM {src} WHERE {where_sql}"#);
+        let sql = format!(r#"INSERT IGNORE INTO {stage}(job_id,source_row_key,source_record_id,first_name,middle_name,middle_initial,last_name,birthdate,birth_year,birth_month,birth_day,barangay_code,city_code,first_initial,last_initial,first_prefix3,last_prefix3,key_l1,key_l2,key_l3,key_full_name)
+            SELECT ?,source_row_key,source_record_id,first_name,middle_name,middle_initial,last_name,birthdate,YEAR(birthdate),MONTH(birthdate),DAY(birthdate),barangay_code,city_code,LEFT(first_name,1),LEFT(last_name,1),LEFT(first_name,3),LEFT(last_name,3),
+            UNHEX(MD5(CONCAT_WS(CHAR(31),first_name,middle_name,last_name,COALESCE(DATE_FORMAT(birthdate,'%Y-%m-%d'),'')))),
+            UNHEX(MD5(CONCAT_WS(CHAR(31),first_name,middle_initial,last_name,COALESCE(DATE_FORMAT(birthdate,'%Y-%m-%d'),'')))),
+            UNHEX(MD5(CONCAT_WS(CHAR(31),first_name,last_name,COALESCE(DATE_FORMAT(birthdate,'%Y-%m-%d'),'')))),
+            UNHEX(MD5(CONCAT_WS(CHAR(31),first_name,middle_name,last_name))) FROM ({derived}) s"#);
+        out.query_drop("START TRANSACTION")?;
+        let result = if cursor.is_empty() { out.exec_drop(&sql, (job_id, &hi)) } else { out.exec_drop(&sql, (job_id, &cursor, &hi)) };
+        if let Err(e) = result { let _ = out.query_drop("ROLLBACK"); return Err(e.into()); }
+        let inserted = out.affected_rows();
+        cursor = hi;
+        out.exec_drop(format!("UPDATE {} SET stage_cursor=?,current_phase='STAGING',total_source_rows=total_source_rows+?,updated_at=NOW() WHERE job_id=?", db::qident(JOBS_TABLE)), (&cursor, inserted, job_id))?;
+        out.query_drop("COMMIT")?;
+        log(tx, format!("Input stage checkpoint: source key {cursor}"));
+    }
+    out.exec_drop(format!("UPDATE {} SET stage_cursor='__DONE__',current_phase='STAGED',updated_at=NOW() WHERE job_id=?", db::qident(JOBS_TABLE)), (job_id,))?;
+    Ok(())
+}
+
+fn read_source_page(pool: &Pool, source: &crate::model::DbConfig, fields: &crate::model::FieldMap, cursor: &str, limit: usize) -> Result<Vec<SourceRow>> {
+    let mut c = pool.get_conn()?;
+    let table = db::qtable(&source.database, &source.table);
+    let k = db::qident(&fields.row_key);
+    let p = db::qident(&fields.person_id);
+    let f = db::qident(&fields.first_name);
+    let m = db::qident(&fields.middle_name);
+    let l = db::qident(&fields.last_name);
+    let bd = db::qident(&fields.birthdate);
+    let mi = if fields.middle_initial.trim().is_empty() { "''".to_string() } else { format!("COALESCE(CAST({} AS CHAR),'')", db::qident(&fields.middle_initial)) };
+    let bg = if fields.barangay_code.trim().is_empty() { "''".into() } else { format!("COALESCE(CAST({} AS CHAR),'')", db::qident(&fields.barangay_code)) };
+    let city = if fields.city_code.trim().is_empty() { "''".into() } else { format!("COALESCE(CAST({} AS CHAR),'')", db::qident(&fields.city_code)) };
+    let select = format!("SELECT CAST({k} AS CHAR),COALESCE(CAST({p} AS CHAR),''),COALESCE(CAST({f} AS CHAR),''),COALESCE(CAST({m} AS CHAR),''),{mi},COALESCE(CAST({l} AS CHAR),''),COALESCE(DATE_FORMAT({bd},'%Y-%m-%d'),''),{bg},{city} FROM {table}");
+    let sql = if cursor.is_empty() {
+        format!("{select} ORDER BY {k} LIMIT {limit}")
+    } else {
+        format!("{select} WHERE {k}>? ORDER BY {k} LIMIT {limit}")
+    };
+    type T = (String, String, String, String, String, String, String, String, String);
+    let raw: Vec<T> = if cursor.is_empty() { c.query(sql)? } else { c.exec(sql, (cursor,))? };
+    Ok(raw.into_iter().map(|(row_key, person_id, first, middle, mi, last, dob, barangay, city)| SourceRow {
+        row_key,
+        person_id,
+        first: normalize(&first),
+        middle: normalize(&middle),
+        mi: normalize_mi(&mi, &middle),
+        last: normalize(&last),
+        birthdate: crate::normalize::parse_date(&dob),
+        barangay: normalize(&barangay),
+        city: normalize(&city),
+    }).collect())
+}
+
+fn insert_base_rows(c: &mut PooledConn, rows: &[SourceRow]) -> Result<()> {
+    let sql = format!(r#"INSERT IGNORE INTO {
