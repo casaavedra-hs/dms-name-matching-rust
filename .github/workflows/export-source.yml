@@ -1,0 +1,25 @@
+name: Export Source Snapshot
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/export-source.yml
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract uploaded source
+        run: |
+          rm -rf extracted
+          mkdir extracted
+          unzip -q DMS_Name_Matching_Rust_v11_3_3_COMPLETE.zip -d extracted
+          find extracted -maxdepth 4 -type f | sort
+      - name: Upload extracted source
+        uses: actions/upload-artifact@v4
+        with:
+          name: DMS-Source-Snapshot
+          path: extracted
+          if-no-files-found: error
