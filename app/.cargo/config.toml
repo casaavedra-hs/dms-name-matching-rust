@@ -1,0 +1,11 @@
+[net]
+retry = 10
+
+[registries.crates-io]
+protocol = "sparse"
+
+[target.x86_64-pc-windows-gnullvm]
+linker = "rust-lld"
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-Clink-self-contained=yes"]
