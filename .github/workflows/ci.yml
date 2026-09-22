@@ -61,6 +61,25 @@ jobs:
           echo "Rust application: $APP_DIR"
           test -f "$APP_DIR/src/main.rs"
 
+      - name: Apply v11.4.0 application overlay
+        shell: bash
+        run: |
+          unzip -qo overlay/v11.4.0-ui-auth-output.zip -d "$APP_DIR"
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          app = Path(os.environ["APP_DIR"])
+          cargo = app / "Cargo.toml"
+          text = cargo.read_text(encoding="utf-8").replace('version = "11.3.3"', 'version = "11.4.0"')
+          cargo.write_text(text, encoding="utf-8")
+          model = app / "src" / "model.rs"
+          text = model.read_text(encoding="utf-8").replace('11.3.3-rust-web', '11.4.0-rust-web')
+          model.write_text(text, encoding="utf-8")
+          PY
+          test -f "$APP_DIR/src/web_ui.rs"
+          test -f "$APP_DIR/web/app.js"
+          node --check "$APP_DIR/web/app.js"
+
       - name: Install pinned Rust
         uses: dtolnay/rust-toolchain@master
         with:
