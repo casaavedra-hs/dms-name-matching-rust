@@ -21,7 +21,7 @@ pub struct ColumnInfo {
 }
 
 pub fn qident(v: &str) -> String {
-    format!("{}`{}", "`", v.replace('`', "``")) + "`"
+    format!("`{}`", v.replace('`', "``"))
 }
 
 pub fn qtable(db: &str, table: &str) -> String {
