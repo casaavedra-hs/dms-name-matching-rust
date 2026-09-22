@@ -1,0 +1,141 @@
+BaseSig { host: &cfg.source1.host, port: cfg.source1.port, database: &cfg.source1.database, table: &cfg.source1.table, fields: &cfg.source1_fields, normalization: NORMALIZATION_VERSION };
+    Ok(format!("{:x}", md5::compute(serde_json::to_vec(&s)?)))
+}
+
+fn create_or_resume_job(pool: &Pool, job_id: &str, cfg: &AppConfig, hash: &str) -> Result<()> {
+    let mut c = pool.get_conn()?;
+    let existing: Option<(String, String)> = c.exec_first(
+        format!("SELECT config_hash,status FROM {} WHERE job_id=?", db::qident(JOBS_TABLE)),
+        (job_id,),
+    )?;
+    if let Some((old_hash, _)) = existing {
+        if old_hash != hash { bail!("This Job ID belongs to a different matching configuration. Start a new job or restore the original configuration."); }
+        c.exec_drop(format!("UPDATE {} SET status='RUNNING',updated_at=NOW() WHERE job_id=?", db::qident(JOBS_TABLE)), (job_id,))?;
+        return Ok(());
+    }
+    let levels = cfg.selected_levels.iter().map(|x| x.code()).collect::<Vec<_>>().join(",");
+    let config_json = serde_json::to_string(cfg)?;
+    c.exec_drop(
+        format!("INSERT INTO {}(job_id,process_mode,consolidation_mode,selected_levels,config_hash,status,current_phase,config_json,started_at,updated_at) VALUES(?,?,?,?,?,'RUNNING','INITIALIZING',?,NOW(),NOW())", db::qident(JOBS_TABLE)),
+        (job_id, format!("{:?}", cfg.mode), format!("{:?}", cfg.consolidation), levels, hash, config_json),
+    )?;
+    Ok(())
+}
+
+fn check_control(control: &EngineControl) -> Result<()> {
+    if control.is_stopped() { bail!("Processing stopped by user. Checkpoints were preserved and the same Job ID can be resumed."); }
+    while control.is_paused() {
+        if control.is_stopped() { bail!("Processing stopped by user while paused. Checkpoints were preserved."); }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    Ok(())
+}
+
+fn log(tx: &Sender<EngineEvent>, msg: impl Into<String>) { let _ = tx.send(EngineEvent::Log(msg.into())); }
+
+fn fmt_u64(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 { out.push(','); }
+        out.push(ch);
+    }
+    out
+}
+
+fn source_for_stage<'a>(cfg: &'a AppConfig) -> (&'a crate::model::DbConfig, &'a crate::model::FieldMap) {
+    if matches!(cfg.mode, ProcessMode::DedupOnly) { (&cfg.source1, &cfg.source1_fields) } else { (&cfg.source2, &cfg.source2_fields) }
+}
+
+fn build_or_reuse_base(cfg: &AppConfig, output_pool: &Pool, tx: &Sender<EngineEvent>, control: &EngineControl) -> Result<()> {
+    let sig = base_signature(cfg)?;
+    let mut out = output_pool.get_conn()?;
+    let reg: Option<(String, String, Option<String>)> = out.query_first(format!("SELECT base_signature,status,build_cursor FROM {} WHERE id=1", db::qident(BASE_REGISTRY)))?;
+    if !cfg.rebuild_base_index {
+        if let Some((old, status, _)) = &reg {
+            if old == &sig && status == "READY" {
+                log(tx, "Base index signature matches. Reusing prepared Rust/MySQL base index.");
+                return Ok(());
+            }
+        }
+    }
+
+    let resume = reg.as_ref().is_some_and(|(old, status, _)| old == &sig && status == "BUILDING") && !cfg.rebuild_base_index;
+    if !resume {
+        log(tx, "Preparing base index. Existing base will be rebuilt because the source/configuration signature changed.");
+        out.query_drop(format!("TRUNCATE TABLE {}", db::qident(BASE_TABLE)))?;
+        out.exec_drop(
+            format!("INSERT INTO {}(id,base_signature,source_description,normalization_version,row_count,build_cursor,status,updated_at) VALUES(1,?,?,?,?,NULL,'BUILDING',NOW()) ON DUPLICATE KEY UPDATE base_signature=VALUES(base_signature),source_description=VALUES(source_description),normalization_version=VALUES(normalization_version),row_count=0,build_cursor=NULL,status='BUILDING',built_at=NULL,updated_at=NOW()", db::qident(BASE_REGISTRY)),
+            (&sig, format!("{}.{}", cfg.source1.database, cfg.source1.table), NORMALIZATION_VERSION, 0u64),
+        )?;
+    }
+    drop(out);
+
+    let cursor = if resume { reg.and_then(|x| x.2).unwrap_or_default() } else { String::new() };
+    if can_fast_stage(&cfg.source1, &cfg.destination) {
+        match fast_stage_base(cfg, output_pool, &sig, cursor.clone(), tx, control) {
+            Ok(()) => return Ok(()),
+            Err(e) => log(tx, format!("Fast server-side base preparation was unavailable ({e}). Falling back to Rust streaming.")),
+        }
+    }
+    stream_stage_base(cfg, output_pool, &sig, cursor, tx, control)
+}
+
+fn can_fast_stage(source: &crate::model::DbConfig, dest: &crate::model::DbConfig) -> bool {
+    db::same_server(source, dest) && source.user.eq_ignore_ascii_case(&dest.user)
+}
+
+fn norm_sql(col: &str) -> String { crate::normalize::mysql_norm_expr(&db::qident(col)) }
+
+fn normalized_select_sql(fields: &crate::model::FieldMap) -> (String, String, String, String, String, String, String, String, String) {
+    let row_key = format!("CAST({} AS CHAR)", db::qident(&fields.row_key));
+    let person_id = format!("CAST({} AS CHAR)", db::qident(&fields.person_id));
+    let first = norm_sql(&fields.first_name);
+    let middle = norm_sql(&fields.middle_name);
+    let last = norm_sql(&fields.last_name);
+    let mi = if fields.middle_initial.trim().is_empty() {
+        format!("LEFT(REPLACE({middle},'.',''),1)")
+    } else {
+        format!("LEFT(REPLACE({},'.',''),1)", norm_sql(&fields.middle_initial))
+    };
+    let dob = format!("DATE({})", db::qident(&fields.birthdate));
+    let barangay = if fields.barangay_code.trim().is_empty() { "''".into() } else { norm_sql(&fields.barangay_code) };
+    let city = if fields.city_code.trim().is_empty() { "''".into() } else { norm_sql(&fields.city_code) };
+    (row_key, person_id, first, middle, mi, last, dob, barangay, city)
+}
+
+fn high_key(conn: &mut PooledConn, source: &crate::model::DbConfig, row_key: &str, cursor: &str, limit: usize) -> Result<Option<String>> {
+    let table = db::qtable(&source.database, &source.table);
+    let key = db::qident(row_key);
+    let sql = if cursor.is_empty() {
+        format!("SELECT CAST(MAX(k) AS CHAR) FROM (SELECT {key} k FROM {table} ORDER BY {key} LIMIT {limit}) x")
+    } else {
+        format!("SELECT CAST(MAX(k) AS CHAR) FROM (SELECT {key} k FROM {table} WHERE {key}>? ORDER BY {key} LIMIT {limit}) x")
+    };
+    if cursor.is_empty() { Ok(conn.query_first(sql)?) } else { Ok(conn.exec_first(sql, (cursor,))?) }
+}
+
+fn fast_stage_base(cfg: &AppConfig, output_pool: &Pool, sig: &str, mut cursor: String, tx: &Sender<EngineEvent>, control: &EngineControl) -> Result<()> {
+    let mut out = output_pool.get_conn()?;
+    loop {
+        check_control(control)?;
+        let hi = match high_key(&mut out, &cfg.source1, &cfg.source1_fields.row_key, &cursor, cfg.performance.exact_batch_size)? {
+            Some(x) => x,
+            None => break,
+        };
+        let (row_key, person_id, first, middle, mi, last, dob, barangay, city) = normalized_select_sql(&cfg.source1_fields);
+        let src = db::qtable(&cfg.source1.database, &cfg.source1.table);
+        let base = db::qident(BASE_TABLE);
+        let keycol = db::qident(&cfg.source1_fields.row_key);
+        let where_sql = if cursor.is_empty() { format!("{keycol}<=?") } else { format!("{keycol}>? AND {keycol}<=?") };
+        let derived = format!(r#"SELECT {row_key} source_row_key,{person_id} person_id,{first} first_name,{middle} middle_name,{mi} middle_initial,{last} last_name,{dob} birthdate,{barangay} barangay_code,{city} city_code FROM {src} WHERE {where_sql}"#);
+        let sql = format!(r#"INSERT IGNORE INTO {base}(source_row_key,person_id,first_name,middle_name,middle_initial,last_name,birthdate,birth_year,birth_month,birth_day,barangay_code,city_code,first_initial,last_initial,first_prefix3,last_prefix3,key_l1,key_l2,key_l3,key_full_name)
+            SELECT source_row_key,person_id,first_name,middle_name,middle_initial,last_name,birthdate,YEAR(birthdate),MONTH(birthdate),DAY(birthdate),barangay_code,city_code,LEFT(first_name,1),LEFT(last_name,1),LEFT(first_name,3),LEFT(last_name,3),
+            UNHEX(MD5(CONCAT_WS(CHAR(31),first_name,middle_name,last_name,COALESCE(DATE_FORMAT(birthdate,'%Y-%m-%d'),'')))),
+            UNHEX(MD5(CONCAT_WS(CHAR(31),first_name,middle_initial,last_name,COALESCE(DATE_FORMAT(birthdate,'%Y-%m-%d'),'')))),
+            UNHEX(MD5(CONCAT_WS(CHAR(31),first_name,last_name,COALESCE(DATE_FORMAT(birthdate,'%Y-%m-%d'),'')))),
+            UNHEX(MD5(CONCAT_WS(CHAR(31),first_name,middle_name,last_name))) FROM ({derived}) s"#);
+        out.query_drop("START TRANSACTION")?;
+        let result = if cursor.is_empty() { out.exec_drop(&sql, (&hi,)) } else { out.exec_drop(&sql, (&cursor, &hi)) };
+        if let Err(e) = result { let _ = out.query_drop("ROLLBACK"); return Err(e.into()); }
+        let inserted = out.affected_rows();
