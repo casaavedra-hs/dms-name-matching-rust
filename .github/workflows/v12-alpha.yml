@@ -1,0 +1,58 @@
+name: v12 Alpha Build
+
+on:
+  push:
+    branches: [v12-enterprise-development]
+    paths:
+      - 'v12-alpha/**'
+      - '.github/workflows/v12-alpha.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build v12 alpha on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: DMS-Name-Matching-v12-Alpha-Windows-x64
+            exe: dms-name-matching-v12-alpha.exe
+          - os: ubuntu-latest
+            artifact: DMS-Name-Matching-v12-Alpha-Linux-x64
+            exe: dms-name-matching-v12-alpha
+          - os: macos-latest
+            artifact: DMS-Name-Matching-v12-Alpha-macOS
+            exe: dms-name-matching-v12-alpha
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check
+        run: cargo check --manifest-path v12-alpha/Cargo.toml
+      - name: Test
+        run: cargo test --manifest-path v12-alpha/Cargo.toml
+      - name: Build release
+        run: cargo build --release --manifest-path v12-alpha/Cargo.toml
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "v12-alpha/target/release/${{ matrix.exe }}" "dist/DMS_Name_Matching_v12_Alpha.exe"
+          Set-Content -Path "dist/Run DMS Name Matching v12 Alpha.bat" -Value '@echo off`r`nDMS_Name_Matching_v12_Alpha.exe`r`npause`r`n'
+          Get-FileHash "dist/DMS_Name_Matching_v12_Alpha.exe" -Algorithm SHA256 | Format-List | Out-File "dist/SHA256.txt"
+      - name: Package Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "v12-alpha/target/release/${{ matrix.exe }}" "dist/DMS_Name_Matching_v12_Alpha"
+          chmod +x "dist/DMS_Name_Matching_v12_Alpha"
+          shasum -a 256 "dist/DMS_Name_Matching_v12_Alpha" > "dist/SHA256.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
+          if-no-files-found: error
