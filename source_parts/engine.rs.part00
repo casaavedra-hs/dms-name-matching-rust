@@ -1,0 +1,220 @@
+use std::{
+    collections::HashMap,
+    sync::{Arc, atomic::{AtomicBool, Ordering}},
+    time::Instant,
+};
+
+use anyhow::{bail, Result};
+use chrono::{Datelike, NaiveDate};
+use crossbeam_channel::Sender;
+use mysql::{params, prelude::Queryable, Pool, PooledConn};
+use rayon::ThreadPoolBuilder;
+use serde::Serialize;
+
+use crate::{
+    db::{self, BASE_REGISTRY, BASE_TABLE, DEDUP_TABLE, JOBS_TABLE, LEVEL_STATS_TABLE, METRICS_TABLE, RESULTS_TABLE, STAGE_TABLE},
+    fuzzy::{Candidate, SimilarityEngine},
+    model::{AppConfig, ConsolidationMode, EngineEvent, JobSnapshot, MatchLevel, ProcessMode, NORMALIZATION_VERSION},
+    normalize::{first_char, md5_key, normalize, normalize_mi, prefix_chars},
+    resources::ResourceGovernor,
+};
+
+#[derive(Clone)]
+pub struct EngineControl {
+    stop: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
+}
+
+impl Default for EngineControl {
+    fn default() -> Self {
+        Self { stop: Arc::new(AtomicBool::new(false)), pause: Arc::new(AtomicBool::new(false)) }
+    }
+}
+
+impl EngineControl {
+    pub fn request_stop(&self) { self.stop.store(true, Ordering::SeqCst); }
+    pub fn request_pause(&self, paused: bool) { self.pause.store(paused, Ordering::SeqCst); }
+    pub fn is_stopped(&self) -> bool { self.stop.load(Ordering::SeqCst) }
+    pub fn is_paused(&self) -> bool { self.pause.load(Ordering::SeqCst) }
+}
+
+#[derive(Debug, Clone)]
+struct SourceRow {
+    row_key: String,
+    person_id: String,
+    first: String,
+    middle: String,
+    mi: String,
+    last: String,
+    birthdate: Option<NaiveDate>,
+    barangay: String,
+    city: String,
+}
+
+#[derive(Debug, Clone)]
+struct ExactDecision {
+    source_row_id: u64,
+    source_record_id: String,
+    base_row_id: u64,
+    base_record_id: String,
+    candidate_count: u64,
+}
+
+#[derive(Debug, Clone)]
+struct LevelProgress {
+    status: String,
+    cursor: u64,
+}
+
+fn new_job_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let millis = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("JOB-{millis}-{}-{seq}", std::process::id())
+}
+
+pub fn spawn_job(config: AppConfig, resume_job_id: Option<String>, tx: Sender<EngineEvent>, control: EngineControl) -> String {
+    let job_id = resume_job_id.unwrap_or_else(new_job_id);
+    let thread_job = job_id.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(EngineEvent::Log(format!("Starting Rust matching engine job {thread_job}")));
+        match run_job(&thread_job, config, &tx, &control) {
+            Ok(snapshot) => { let _ = tx.send(EngineEvent::Finished(snapshot)); }
+            Err(e) => { let _ = tx.send(EngineEvent::Failed(format!("{e:#}"))); }
+        }
+    });
+    job_id
+}
+
+pub fn run_job(job_id: &str, config: AppConfig, tx: &Sender<EngineEvent>, control: &EngineControl) -> Result<JobSnapshot> {
+    validate_config(&config)?;
+    db::ensure_schema(&config.destination)?;
+    let output_pool = db::pool(&config.destination)?;
+    let config_hash = config_hash(&config)?;
+    create_or_resume_job(&output_pool, job_id, &config, &config_hash)?;
+
+    ThreadPoolBuilder::new()
+        .num_threads(config.performance.cpu_workers.max(1))
+        .build_global()
+        .ok();
+
+    let mut similarity = SimilarityEngine::new(config.performance.gpu_mode, config.performance.gpu_min_field_pairs);
+    log(tx, format!("CPU workers: {} | RAM ceiling: {:.0}% | GPU: {} ({})",
+        config.performance.cpu_workers,
+        config.performance.memory_limit_percent,
+        similarity.gpu_name,
+        similarity.gpu_backend));
+
+    if config.mode.needs_base() {
+        check_control(control)?;
+        build_or_reuse_base(&config, &output_pool, tx, control)?;
+    }
+
+    check_control(control)?;
+    stage_input(job_id, &config, &output_pool, tx, control)?;
+
+    if config.mode.needs_dedup() {
+        check_control(control)?;
+        run_dedup(job_id, &config, &output_pool, tx, control, &mut similarity)?;
+        if matches!(config.mode, ProcessMode::DedupOnly) {
+            finalize_dedup_only(job_id, &output_pool)?;
+            let s = refresh_snapshot(job_id, &output_pool, &similarity)?;
+            return Ok(s);
+        }
+    }
+
+    if config.mode.needs_base() {
+        run_name_matching(job_id, &config, &output_pool, tx, control, &mut similarity)?;
+        terminalize_results(job_id, &output_pool)?;
+        if matches!(config.mode, ProcessMode::DedupConsolidateMatch) {
+            inherit_consolidated_results(job_id, &output_pool)?;
+        }
+    }
+
+    reconcile(job_id, &config, &output_pool)?;
+    let mut c = output_pool.get_conn()?;
+    c.exec_drop(
+        format!("UPDATE {} SET status='DONE',current_phase='DONE',finished_at=NOW(),updated_at=NOW() WHERE job_id=?", db::qident(JOBS_TABLE)),
+        (job_id,),
+    )?;
+    let s = refresh_snapshot(job_id, &output_pool, &similarity)?;
+    let _ = tx.send(EngineEvent::Snapshot(s.clone()));
+    Ok(s)
+}
+
+fn validate_config(cfg: &AppConfig) -> Result<()> {
+    if cfg.selected_levels.is_empty() { bail!("Select at least one matching level."); }
+    db::validate_identifier(&cfg.destination.database, "Destination database")?;
+    db::validate_identifier(&cfg.source1.database, "Source 1 database")?;
+    db::validate_identifier(&cfg.source1.table, "Source 1 table")?;
+    validate_map(&cfg.source1_fields)?;
+    if !matches!(cfg.mode, ProcessMode::DedupOnly) {
+        db::validate_identifier(&cfg.source2.database, "Source 2 database")?;
+        db::validate_identifier(&cfg.source2.table, "Source 2 table")?;
+        validate_map(&cfg.source2_fields)?;
+    }
+    let needs_mi = [MatchLevel::L02, MatchLevel::L13, MatchLevel::L16].iter().any(|l| cfg.selected(*l));
+    let needs_barangay = [MatchLevel::L12, MatchLevel::L13, MatchLevel::L14].iter().any(|l| cfg.selected(*l));
+    let needs_city = [MatchLevel::L15, MatchLevel::L16, MatchLevel::L17].iter().any(|l| cfg.selected(*l));
+    if needs_mi {
+        db::validate_identifier(&cfg.source1_fields.middle_initial, "Source 1 middle initial")?;
+        if !matches!(cfg.mode, ProcessMode::DedupOnly) { db::validate_identifier(&cfg.source2_fields.middle_initial, "Source 2 middle initial")?; }
+    }
+    if needs_barangay {
+        db::validate_identifier(&cfg.source1_fields.barangay_code, "Source 1 barangay code")?;
+        if !matches!(cfg.mode, ProcessMode::DedupOnly) { db::validate_identifier(&cfg.source2_fields.barangay_code, "Source 2 barangay code")?; }
+    }
+    if needs_city {
+        db::validate_identifier(&cfg.source1_fields.city_code, "Source 1 city/municipality code")?;
+        if !matches!(cfg.mode, ProcessMode::DedupOnly) { db::validate_identifier(&cfg.source2_fields.city_code, "Source 2 city/municipality code")?; }
+    }
+    if cfg.performance.memory_limit_percent < 50.0 || cfg.performance.memory_limit_percent > 95.0 {
+        bail!("Memory limit must be between 50% and 95%.");
+    }
+    Ok(())
+}
+
+fn validate_map(m: &crate::model::FieldMap) -> Result<()> {
+    for (name, value) in [
+        ("Unique row key", &m.row_key), ("Person ID", &m.person_id), ("First name", &m.first_name),
+        ("Middle name", &m.middle_name), ("Last name", &m.last_name), ("Birthdate", &m.birthdate),
+    ] {
+        db::validate_identifier(value, name)?;
+    }
+    Ok(())
+}
+
+fn config_hash(cfg: &AppConfig) -> Result<String> {
+    #[derive(Serialize)]
+    struct SafeCfg<'a> {
+        mode: ProcessMode,
+        consolidation: ConsolidationMode,
+        source1_host: &'a str, source1_port: u16, source1_db: &'a str, source1_table: &'a str,
+        source2_host: &'a str, source2_port: u16, source2_db: &'a str, source2_table: &'a str,
+        fields1: &'a crate::model::FieldMap, fields2: &'a crate::model::FieldMap,
+        levels: &'a [MatchLevel], thresholds: &'a crate::model::ThresholdConfig,
+        normalization: &'static str,
+    }
+    let safe = SafeCfg {
+        mode: cfg.mode, consolidation: cfg.consolidation,
+        source1_host: &cfg.source1.host, source1_port: cfg.source1.port, source1_db: &cfg.source1.database, source1_table: &cfg.source1.table,
+        source2_host: &cfg.source2.host, source2_port: cfg.source2.port, source2_db: &cfg.source2.database, source2_table: &cfg.source2.table,
+        fields1: &cfg.source1_fields, fields2: &cfg.source2_fields,
+        levels: &cfg.selected_levels, thresholds: &cfg.thresholds,
+        normalization: NORMALIZATION_VERSION,
+    };
+    let bytes = serde_json::to_vec(&safe)?;
+    Ok(format!("{:x}", md5::compute(bytes)))
+}
+
+fn base_signature(cfg: &AppConfig) -> Result<String> {
+    #[derive(Serialize)]
+    struct BaseSig<'a> {
+        host: &'a str, port: u16, database: &'a str, table: &'a str,
+        fields: &'a crate::model::FieldMap, normalization: &'static str,
+    }
+    let s = BaseSig { host:&cfg.source1.host, port:cfg.source1.port, database:&cfg.source1.database, table:&cfg.source1.table, fields:&cfg.source1_fields, normalization:NORMALIZATION_VERSION };
+    Ok(format!("{:x}", md5::compute(serde_json::to_vec(&s)?)))
+}
